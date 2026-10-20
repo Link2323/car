@@ -1,0 +1,33 @@
+# ===== Keil MDK 编译产物 =====
+# MDK-ARM/car/ 是编译输出目录（.axf/.o/.d/.crf/.htm/.map/.hex 等都在里面）
+MDK-ARM/car/
+
+# 调试器配置与中间文件（Keil 自动重新生成）
+MDK-ARM/DebugConfig/
+# Keil 界面布局文件，因人而异，不纳入版本管理
+*.uvguix.*
+*.dep
+*.iex
+# 编译列表文件，如 startup_stm32f103xb.lst
+*.lst
+
+# JLink / ULink 烧录调试日志
+JLink*
+*.jlink
+
+# ===== 编译日志（本次已清理，防止以后再混入）=====
+*.log
+
+# ===== 测试程序编译产物 =====
+*.exe
+*.o
+*.obj
+
+# ===== 通用临时文件 =====
+*.bak
+*.tmp
+*~
+# Office 临时文件（OneDrive 目录常见）
+~$*
+# OneDrive/Windows 系统文件
+Desktop.ini

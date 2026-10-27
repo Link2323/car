@@ -13,4 +13,13 @@
    NULL 或超长消息返回 HAL_ERROR，不截断。USART2 发送由本模块独占。 */
 HAL_StatusTypeDef HC05_SendString(const char *message);
 
+/* USART2 初始化后启动单字节中断接收，所有解析和电机操作留在主循环。 */
+HAL_StatusTypeDef HC05_InitReceive(void);
+/* 主循环调用，尝试恢复 UART 错误或启动失败后的接收。 */
+void HC05_ProcessReceive(void);
+/* 从中断接收环形缓冲取一条完整行，去掉 CR/LF；容量需为 128 字节。
+   无完整行返回 HAL_BUSY；溢出或过长行返回 HAL_ERROR 并丢弃至换行，
+   不允许把截断命令或尾部碎片当成新命令执行。 */
+HAL_StatusTypeDef HC05_ReadLine(char *line, uint16_t capacity);
+
 #endif

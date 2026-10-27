@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "config": [0.8, 1.5, 0.0, 0.6, 1.5, 0.0, 2100, 700],
+  "c_initializer": "static const SpeedControl_Config speed_config = {\n  {0.8f, 1.5f, 0.0f}, {0.6f, 1.5f, 0.0f}, 2100.0f, 700\n};",
+  "note": "2026-10-22 COM8 按 wheel_calibration.json 完成 50/75/100 mm/s 各3秒落地试验，100 mm/s复测；PID保持不变，目标上限提高为2100 counts/s，占空比仍为70%。轮端速度估计不等于独立验证的车身速度；源码断电保留需烧录。"
+}

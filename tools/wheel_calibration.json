@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "left": {
+    "counts_per_rev": 2770.2,
+    "circumference_mm": 138.230077
+  },
+  "right": {
+    "counts_per_rev": 2772.0,
+    "circumference_mm": 138.230077
+  }
+}

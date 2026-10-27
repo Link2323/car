@@ -22,6 +22,7 @@ JLink*
 *.exe
 *.o
 *.obj
+__pycache__/
 
 # ===== 通用临时文件 =====
 *.bak

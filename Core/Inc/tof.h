@@ -7,8 +7,10 @@
 extern "C" {
 #endif
 
-/* 当前仅连接前方模块，左右 XSHUT 始终保持低电平。 */
+/* 三路共享 I2C1，地址均为七位地址，通过 XSHUT 逐路释放后改址。 */
 #define TOF_FRONT_ADDRESS       0x31U
+#define TOF_LEFT_ADDRESS        0x30U
+#define TOF_RIGHT_ADDRESS       0x32U
 #define TOF_POLL_PERIOD_MS      5U
 #define TOF_SAMPLE_TIMEOUT_MS   200U
 /* 前方模块临时偏移补偿：输出距离 = 原始距离 - 本值，单位 mm。
@@ -17,6 +19,22 @@ extern "C" {
 #ifndef TOF_FRONT_OFFSET_MM
 #define TOF_FRONT_OFFSET_MM     32
 #endif
+
+/* 左右模块尚未标定，不沿用前方模块的实测补偿。 */
+#ifndef TOF_LEFT_OFFSET_MM
+#define TOF_LEFT_OFFSET_MM      0
+#endif
+#ifndef TOF_RIGHT_OFFSET_MM
+#define TOF_RIGHT_OFFSET_MM     0
+#endif
+
+typedef enum
+{
+  TOF_FRONT = 0,
+  TOF_LEFT,
+  TOF_RIGHT,
+  TOF_SENSOR_COUNT
+} TOF_Sensor;
 
 typedef enum
 {
@@ -38,14 +56,20 @@ typedef struct
   uint16_t raw_distance_mm; /* 器件原始距离，不做偏移补偿，便于调试和重新标定。 */
 } TOF_Data;
 
-/* 初始化前方 VL53L0X 并改地址；仅在主循环、GPIO/I2C 初始化后调用。
-   包含启动延时与有界参考校准；失败时关闭前方器件，可再次调用重试。 */
+/* 初始化全部三路并逐路改址；仅在 GPIO/I2C 初始化后的主循环调用。
+   上电初始化包含有界延时；单路失败会关闭该路并继续初始化其他路。
+   全部成功返回 HAL_OK，否则返回首个错误；再次调用会复位全部三路。 */
 HAL_StatusTypeDef TOF_Init(void);
-/* 每轮主循环调用：每 5 ms 查一次就绪位，未就绪立即返回 HAL_BUSY。
-   不等待一次测距完成；I2C 访问仍为有界阻塞，故障后需重新初始化。 */
+/* 每轮主循环调用：独立轮询三路，不等待测距完成。
+   任一路故障仍处理其余路；返回首个错误、或有新帧时 HAL_OK、否则 HAL_BUSY。
+   I2C 访问仍为有界阻塞，故障路关闭后需 TOF_Init 重新初始化。 */
 HAL_StatusTypeDef TOF_Update(void);
-/* 复制前方快照，同时校验数据新鲜度；NULL 返回 HAL_ERROR。 */
+/* 复制前方快照，保留原有接口；同时校验数据新鲜度。 */
 HAL_StatusTypeDef TOF_GetData(TOF_Data *data);
+/* 按方向复制快照并检查新鲜度；方向越界或 NULL 返回 HAL_ERROR。 */
+HAL_StatusTypeDef TOF_GetSensorData(TOF_Sensor sensor, TOF_Data *data);
+/* 返回指定路的最近初始化/读取结果；未就绪不覆盖上一结果。 */
+HAL_StatusTypeDef TOF_GetSensorStatus(TOF_Sensor sensor);
 
 #ifdef __cplusplus
 }

@@ -3,9 +3,10 @@
 
 #include "main.h"
 
-/* 方向需手转车轮确认：希望前进计数为正时，可将对应方向改为 -1。 */
+/* 实测两轮前进时：左侧 TIM3 减计数，右侧 TIM4 加计数。
+   左轮取反以统一为前进为正；更换接线或安装方向后须重新手转确认。 */
 #ifndef ENCODER_LEFT_SIGN
-#define ENCODER_LEFT_SIGN 1
+#define ENCODER_LEFT_SIGN -1
 #endif
 #ifndef ENCODER_RIGHT_SIGN
 #define ENCODER_RIGHT_SIGN 1

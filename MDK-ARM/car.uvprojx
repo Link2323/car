@@ -542,6 +542,16 @@
               <FilePath>../ThirdParty/VL53L0X/VL53L0X.cpp</FilePath>
             </File>
             <File>
+              <FileName>bluetooth_tune.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/bluetooth_tune.c</FilePath>
+            </File>
+            <File>
+              <FileName>speed_control.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/speed_control.c</FilePath>
+            </File>
+            <File>
               <FileName>encoder.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/encoder.c</FilePath>

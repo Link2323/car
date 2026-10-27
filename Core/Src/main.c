@@ -3,25 +3,36 @@
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
-#include "hc05.h"
-#include <stdio.h>
 
 /* USER CODE BEGIN Includes */
 #include "mpu6050.h"
 #include "motor.h"
 #include "encoder.h"
 #include "tof.h"
+#include "speed_control.h"
+#include "hc05.h"
+#include "bluetooth_tune.h"
+#include <stdio.h>
 /* USER CODE END Includes */
 
 
 
 /* USER CODE BEGIN PD */
-/* 临时电机调试开关：设为 0 后恢复默认禁用、不自动转动的行为。 */
-#define MOTOR_DEBUG_ENABLE       1U
-#define MOTOR_DEBUG_WAIT_MS      3000U
-#define MOTOR_DEBUG_RAMP_MS      2000U
-#define MOTOR_DEBUG_HOLD_MS      3000U
-#define MOTOR_DEBUG_MAX_DUTY     500U
+/* 蓝牙调参模式优先，禁止旧的自动试转流程与电脑命令同时控制电机。 */
+#ifndef BLUETOOTH_TUNE_ENABLE
+#define BLUETOOTH_TUNE_ENABLE 1
+#endif
+/* 架空并确认编码器方向后才可开启试转；默认上电只采集，不驱动车轮。 */
+#ifndef MOTOR_DEBUG_SPEED_ENABLE
+#define MOTOR_DEBUG_SPEED_ENABLE 0
+#endif
+#define MOTOR_DEBUG_SPEED_COUNTS_PER_S 500.0f
+#define MOTOR_DEBUG_SPEED_DURATION_MS 4000U
+/* 200 ms 一帧，避免 9600 波特率下调试信息占满发送缓冲。 */
+#ifndef SPEED_DEBUG_TELEMETRY_ENABLE
+#define SPEED_DEBUG_TELEMETRY_ENABLE 1
+#endif
+#define SPEED_DEBUG_TELEMETRY_PERIOD_MS 200U
 /* USER CODE END PD */
 
 
@@ -36,86 +47,109 @@ HAL_StatusTypeDef mpu6050_cal_status = HAL_ERROR;
 HAL_StatusTypeDef mpu6050_read_status = HAL_ERROR;
 uint32_t gyro_last_update_tick = 0;
 uint8_t gyro_valid = 0;
-/* ST-Link 可观察双轮增量、累计计数和计数率，蓝牙输出计数率曲线。 */
+/* 保存双轮增量、累计计数和计数率，供控制逻辑及调试器读取。 */
 Encoder_Data car_encoder;
 HAL_StatusTypeDef encoder_status = HAL_ERROR;
-/* 前方测距快照和初始化状态，便于通过调试器核查故障。 */
+/* 保存三路测距快照和逐路状态；car_tof 保留前方兼容快照。 */
 TOF_Data car_tof;
 HAL_StatusTypeDef tof_status = HAL_ERROR;
-#if MOTOR_DEBUG_ENABLE
-/* 从外设初始化完成后计时，先给调试和供电操作预留静止等待。 */
-static uint32_t motor_debug_start_tick;
-#endif
+TOF_Data car_tof_sensors[TOF_SENSOR_COUNT];
+HAL_StatusTypeDef tof_sensor_status[TOF_SENSOR_COUNT];
+/* 已按保存的轮端标定完成落地 50/75/100 mm/s 短试转，100 mm/s 复测两次。
+   速度反馈仅 10 ms 计数率、遥测仅 5 Hz，不将本组视为最终最优参数。 */
+static const SpeedControl_Config speed_config = {
+  {0.8f, 1.5f, 0.0f}, {0.6f, 1.5f, 0.0f}, 2100.0f, 700
+};
+SpeedControl_Data car_speed;
+HAL_StatusTypeDef speed_control_status = HAL_ERROR;
 /* USER CODE END PV */
 
 void SystemClock_Config(void);
 
 
 /* USER CODE BEGIN 0 */
-#if MOTOR_DEBUG_ENABLE
-/* 循环调试：等待 3 秒，2 秒内升至 50%，保持 3 秒后停机并进入下一轮等待。
-   没有轮速闭环，低占空比不保证能起转，也不代表恒定低转速。
-   全程不阻塞；接口出错则停止并锁定测试，不继续自动重试。 */
-static void Motor_DebugProcess(void)
+/* 可选一次性试转：获得有效反馈后启动，定时结束或故障后不自动重试。 */
+static void Speed_DebugProcess(void)
 {
-  static uint8_t started = 0U;
-  static uint8_t faulted = 0U;
-  static int16_t last_duty = -1;
-  uint32_t elapsed = (uint32_t)(HAL_GetTick() - motor_debug_start_tick);
-  uint32_t ramp_elapsed;
-  int16_t duty;
-
-  /* 每轮等待阶段不使能电机；故障后保持停机，直到重新复位。 */
-  if (faulted != 0U || elapsed < MOTOR_DEBUG_WAIT_MS)
+#if MOTOR_DEBUG_SPEED_ENABLE && !BLUETOOTH_TUNE_ENABLE
+  static uint8_t phase = 0U;
+  static uint32_t started = 0U;
+  HAL_StatusTypeDef status;
+  if (phase == 0U)
   {
-    return;
-  }
-  /* 主循环因其他任务延误时，超过软件计时时长后先停机，不补跑旧步骤。
-     调试器暂停可能同时停止系统节拍，因此此处不是独立的硬件超时保护。 */
-  if (elapsed >= MOTOR_DEBUG_WAIT_MS + MOTOR_DEBUG_RAMP_MS + MOTOR_DEBUG_HOLD_MS)
-  {
-    Motor_Disable();
-    /* 清除上一轮状态，从当前时刻重新等待 3 秒，避免跨轮保持旧的 PWM。 */
-    started = 0U;
-    last_duty = -1;
-    motor_debug_start_tick = HAL_GetTick();
-    return;
-  }
-  if (started == 0U)
-  {
-    if (Motor_Enable() != HAL_OK)
+    status = SpeedControl_Enable();
+    if (status == HAL_OK)
     {
-      Motor_Disable();
-      faulted = 1U;
-      return;
+      started = HAL_GetTick();
+      status = SpeedControl_SetTarget(MOTOR_DEBUG_SPEED_COUNTS_PER_S,
+                                     MOTOR_DEBUG_SPEED_COUNTS_PER_S);
+      phase = (status == HAL_OK) ? 1U : 2U;
     }
-    started = 1U;
-  }
-
-  ramp_elapsed = elapsed - MOTOR_DEBUG_WAIT_MS;
-  /* 斜坡结束后保持目标上限，避免占空比继续增加。 */
-  if (ramp_elapsed > MOTOR_DEBUG_RAMP_MS)
-  {
-    ramp_elapsed = MOTOR_DEBUG_RAMP_MS;
-  }
-  duty = (int16_t)(MOTOR_DEBUG_MAX_DUTY * ramp_elapsed / MOTOR_DEBUG_RAMP_MS);
-  if (duty != last_duty)
-  {
-    /* 两轮使用前进正命令，驱动层已按实测对右轮方向进行反转校正。 */
-    if (Motor_SetDuty(duty, duty) != HAL_OK)
+    else if (status != HAL_BUSY)
     {
-      Motor_Disable();
-      faulted = 1U;
-      return;
+      phase = 2U;
     }
-    last_duty = duty;
   }
-}
+  else if (phase == 1U)
+  {
+    (void)SpeedControl_GetData(&car_speed);
+    if (car_speed.state == SPEED_CONTROL_FAULT)
+    {
+      /* 保留故障锁存供调试，不在此处清除或自动恢复。 */
+      phase = 2U;
+    }
+    else if ((uint32_t)(HAL_GetTick() - started) >= MOTOR_DEBUG_SPEED_DURATION_MS)
+    {
+      SpeedControl_Stop();
+      phase = 2U;
+    }
+  }
 #endif
+}
+
+/* 发送整数 FireWater 帧；目标/实测取整为 counts/s，占空比单位千分比。
+   只监测不驱动时也发布编码器实测，便于手转确认两轮方向。 */
+static void Speed_DebugTelemetry(void)
+{
+#if SPEED_DEBUG_TELEMETRY_ENABLE
+  static uint32_t last_tick = 0U;
+  uint32_t now = HAL_GetTick();
+  char frame[HC05_TX_BUFFER_SIZE];
+  int length;
+  if ((uint32_t)(now - last_tick) < SPEED_DEBUG_TELEMETRY_PERIOD_MS ||
+      !BluetoothTune_CanSendTelemetry()) { return; }
+  last_tick = now;
+  length = snprintf(frame, sizeof(frame), "speed:%d,%d,%ld,%ld,%ld,%ld,%d,%d\n",
+                    (int)car_speed.state, (int)car_speed.fault,
+                    (long)car_speed.left_target, (long)car_speed.right_target,
+                    (long)car_encoder.left_counts_per_s,
+                    (long)car_encoder.right_counts_per_s,
+                    (int)car_speed.left_duty, (int)car_speed.right_duty);
+  /* 串口忙时丢弃该帧，不等待发送完成，不影响控制周期。 */
+  if (length > 0 && (unsigned int)length < sizeof(frame))
+  {
+    (void)HC05_SendString(frame);
+  }
+#endif
+}
+
+/* 统一刷新三路测距快照，同时更新前方兼容变量。 */
+static void TOF_RefreshSnapshots(void)
+{
+  unsigned int i;
+  /* 每路有效性与错误独立保存，单路失效时仍可观察另外两路。 */
+  for (i = 0U; i < TOF_SENSOR_COUNT; ++i)
+  {
+    (void)TOF_GetSensorData((TOF_Sensor)i, &car_tof_sensors[i]);
+    tof_sensor_status[i] = TOF_GetSensorStatus((TOF_Sensor)i);
+  }
+  car_tof = car_tof_sensors[TOF_FRONT];
+}
+
 /* USER CODE END 0 */
 
 /**
-  * @brief  初始化小车外设和传感器，在主循环采集前方距离并通过蓝牙输出。
+  * @brief  初始化小车外设和传感器，在主循环采集测距、陀螺仪和编码器数据。
   * @retval int
   */
 int main(void)
@@ -133,7 +167,7 @@ int main(void)
 	
   /* USER CODE BEGIN 2 */
   /* 上电保持小车静止：先初始化陀螺仪，再采集约 1 秒的静止零偏。
-     此时电机 PWM 尚未启动；失败时保留错误状态供蓝牙和调试器查看。 */
+     此时电机 PWM 尚未启动；失败时保留错误状态供调试器查看。 */
   mpu6050_init_status = MPU6050_Init();
   mpu6050_status = mpu6050_init_status;
   if (mpu6050_status == HAL_OK)
@@ -141,10 +175,9 @@ int main(void)
     mpu6050_cal_status = MPU6050_CalibrateGyro(200U);
     mpu6050_status = mpu6050_cal_status;
   }
-  /* 只释放前方 XSHUT；失败也继续运行，通过蓝牙状态通道报告。 */
+  /* 依次释放三路 XSHUT 并改址；单路失败仍继续采集其他路。 */
   tof_status = TOF_Init();
-  (void)TOF_GetData(&car_tof);
-  /* 串口只输出 FireWater 数值帧，不混入启动文字。 */
+  TOF_RefreshSnapshots();
 
   __HAL_TIM_SET_COUNTER(&htim1, 0);
   __HAL_TIM_CLEAR_FLAG(&htim1, TIM_FLAG_UPDATE);
@@ -152,7 +185,7 @@ int main(void)
   {
     Error_Handler();
   }
-  /* 电机模块先保持禁用，调试开关打开时由循环测试流程延时使能。 */
+  /* 初始化后保持电机禁用，等待控制逻辑显式使能。 */
   if (Motor_Init() != HAL_OK)
   {
     Error_Handler();
@@ -164,32 +197,41 @@ int main(void)
   {
     Error_Handler();
   }
-
-#if MOTOR_DEBUG_ENABLE
-  motor_debug_start_tick = HAL_GetTick();
+  speed_control_status = SpeedControl_Init(&speed_config);
+  if (speed_control_status != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* 启动蓝牙接收，不自动使能电机；调参命令仅在主循环解析。 */
+#if BLUETOOTH_TUNE_ENABLE
+  if (BluetoothTune_Init() != HAL_OK) { Error_Handler(); }
 #endif
+
   /* USER CODE END 2 */
 
   /* USER CODE BEGIN WHILE */
   while (1)
   {
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
-    /* 先处理测试的超时停机，再服务电机状态机，独立于传感器是否在线。 */
-#if MOTOR_DEBUG_ENABLE
-    Motor_DebugProcess();
+    /* 先检查上一轮耗时，防止长时间阻塞后继续使用旧占空比。 */
+    speed_control_status = SpeedControl_Update();
+#if BLUETOOTH_TUNE_ENABLE
+    BluetoothTune_Process();
 #endif
+    /* 电机状态机与速度计算分离，持续服务启动等待和换向空档。 */
     Motor_Process();
-    /* 主循环查询已完成的前方测量，不等待传感器完成一次激光测距。 */
+    /* 主循环查询三路已完成的测量，不等待传感器完成一次激光测距。 */
     {
       HAL_StatusTypeDef update_status = TOF_Update();
       if (update_status != HAL_BUSY)
       {
         tof_status = update_status;
       }
-      (void)TOF_GetData(&car_tof);
+      TOF_RefreshSnapshots();
     }
+    /* I2C 返回后先检查旧反馈年龄，再采样，避免新时间戳掩盖超时。 */
+    speed_control_status = SpeedControl_Update();
     {
       HAL_StatusTypeDef update_status = Encoder_Update();
       /* 只有到达采样周期才更新调试数据；无新采样时保留上一份快照。 */
@@ -199,11 +241,11 @@ int main(void)
         (void)Encoder_GetData(&car_encoder);
       }
     }
+    /* 有新编码器采样才计算 PID，同一份数据不会重复积分。 */
+    speed_control_status = SpeedControl_Update();
     {
-      static uint32_t last_send_tick = 0;
       static uint32_t last_read_tick = 0;
       uint32_t now = HAL_GetTick();
-      char message[96];
 
       /* 每 5 ms 尝试读取一份新样本，阻塞式 I2C 始终在主循环执行。
          初始化或校准失败时不发布未经校准的角速度。 */
@@ -222,23 +264,20 @@ int main(void)
           gyro_valid = 0U;
         }
       }
-
-      /* 蓝牙每 100 ms 输出前方距离与诊断通道，缺测时也发帧，便于定位接线问题。 */
-      now = HAL_GetTick();
-      if ((uint32_t)(now - last_send_tick) >= 100U)
-      {
-        last_send_tick = now;
-        (void)TOF_GetData(&car_tof);
-        /* FireWater CSV：距离(mm)、有效位、诊断状态、器件原始状态。
-           无效距离使用 -1，避免绘图或上位机把旧数据当成当前障碍物距离。 */
-        (void)snprintf(message, sizeof(message), "tof:%ld,%u,%u,%u\n",
-                       car_tof.valid != 0U ? (long)car_tof.distance_mm : -1L,
-                       (unsigned int)car_tof.valid, (unsigned int)car_tof.state,
-                       (unsigned int)car_tof.raw_status);
-        /* 中断发送会复制局部消息；忙时丢弃当前帧，继续服务传感器。 */
-        (void)HC05_SendString(message);
-      }
     }
+    /* 陀螺仪读取也可能阻塞，返回后先处理控制保护，再执行调试操作。 */
+    speed_control_status = SpeedControl_Update();
+    Speed_DebugProcess();
+#if BLUETOOTH_TUNE_ENABLE
+    BluetoothTune_Process();
+#endif
+    (void)SpeedControl_GetData(&car_speed);
+    Speed_DebugTelemetry();
+#if BLUETOOTH_TUNE_ENABLE
+    /* 累计计数与原速度帧分开传输，保留速度曲线的原有 200 ms 周期。 */
+    BluetoothTune_EncoderTelemetry();
+#endif
+
   }
   /* USER CODE END 3 */
 }

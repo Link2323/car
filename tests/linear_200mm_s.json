@@ -1,0 +1,82 @@
+{
+  "requested_mm_s": 200.0,
+  "seconds": 3,
+  "wheel_calibration": {
+    "version": 1,
+    "left": {
+      "counts_per_rev": 2770.2,
+      "circumference_mm": 138.230077
+    },
+    "right": {
+      "counts_per_rev": 2772.0,
+      "circumference_mm": 138.230077
+    }
+  },
+  "original_config": [
+    8000,
+    15000,
+    0,
+    6000,
+    15000,
+    0,
+    3100,
+    700
+  ],
+  "applied_config": [
+    8000,
+    15000,
+    0,
+    6000,
+    15000,
+    0,
+    4100,
+    700
+  ],
+  "begin_encoder": [
+    661504484,
+    0,
+    15237,
+    15148,
+    1,
+    1,
+    171633
+  ],
+  "end_encoder": [
+    661504487,
+    0,
+    27101,
+    27683,
+    1,
+    1,
+    175637
+  ],
+  "started": 12674.9166747,
+  "stop_verified": true,
+  "error": null,
+  "summary": {
+    "running_frames": 15,
+    "late_frames": 6,
+    "left": {
+      "target_counts_s": 4008,
+      "target_mm_s": 199.995,
+      "mean_mm_s": 197.234,
+      "std_mm_s": 5.527,
+      "mae_mm_s": 5.822,
+      "peak_mm_s": 294.404,
+      "mean_duty": 445,
+      "saturated_fraction": 0.0,
+      "total_wheel_travel_mm": 592.001
+    },
+    "right": {
+      "target_counts_s": 4011,
+      "target_mm_s": 200.015,
+      "mean_mm_s": 196.142,
+      "std_mm_s": 7.434,
+      "mae_mm_s": 7.015,
+      "peak_mm_s": 209.44,
+      "mean_duty": 552.5,
+      "saturated_fraction": 0.0,
+      "total_wheel_travel_mm": 625.077
+    }
+  }
+}

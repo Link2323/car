@@ -3,6 +3,7 @@
 #include <assert.h>
 #include <math.h>
 #include <stdio.h>
+#include <string.h>
 
 TIM_HandleTypeDef htim3;
 TIM_HandleTypeDef htim4;
@@ -59,6 +60,23 @@ int main(int argc, char **argv)
   assert(Encoder_GetData(&data) == HAL_ERROR);
 
   /* 失败分支使用独立进程，避免成功初始化状态影响注入结果。 */
+  if (argc > 1 && strcmp(argv[1], "forward") == 0)
+  {
+    /* 回放 COM7 实测：两轮均向前时，左硬件减计数、右硬件加计数。
+       10 ms 内 -13/+12 对应修正前的 -1300/+1200 counts/s。 */
+    assert(Encoder_Init() == HAL_OK);
+    ticks = 10U;
+    left_timer.CNT -= 13U;
+    right_timer.CNT += 12U;
+    assert(Encoder_Update() == HAL_OK);
+    assert(Encoder_GetData(&data) == HAL_OK);
+    assert(data.left_delta == 13 && data.right_delta == 12);
+    CheckNear(data.left_counts_per_s, 1300.0f);
+    CheckNear(data.right_counts_per_s, 1200.0f);
+    puts("Measured forward encoder direction regression passed");
+    return 0;
+  }
+
   if (argc > 1)
   {
     fail_at = 2U;

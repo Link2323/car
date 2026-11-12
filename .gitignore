@@ -1,7 +1,8 @@
 # ===== Keil MDK 编译产物 =====
 # MDK-ARM/car/ 是编译输出目录（.axf/.o/.d/.crf/.htm/.map/.hex 等都在里面）
 MDK-ARM/car/
-
+build_log.txt
+flash_log.txt
 # 调试器配置与中间文件（Keil 自动重新生成）
 MDK-ARM/DebugConfig/
 # Keil 界面布局文件，因人而异，不纳入版本管理

@@ -11,6 +11,8 @@ struct TOF_Context
   uint32_t last_poll_tick;
   uint32_t last_result_tick;
   HAL_StatusTypeDef status;
+  uint32_t last_retry_tick;
+  uint8_t retry_count;
 };
 static TOF_Context sensors[TOF_SENSOR_COUNT];
 static GPIO_TypeDef * const shut_ports[TOF_SENSOR_COUNT] = {
@@ -26,6 +28,30 @@ static const int32_t offsets[TOF_SENSOR_COUNT] = {
   TOF_FRONT_OFFSET_MM, TOF_LEFT_OFFSET_MM, TOF_RIGHT_OFFSET_MM
 };
 
+/* F1 的开漏输出模式不启用内部上拉；释放时切成输入上拉提供弱高电平。
+   关断前先清 ODR，再切回开漏输出，确保三路逐颗启动和故障隔离有效。
+   本接口不使用推挽高电平；电源初始化阶段 GPIO 仍默认开漏拉低。 */
+static void TOF_SetXshut(TOF_Sensor sensor, uint8_t released)
+{
+  GPIO_InitTypeDef config = {0};
+  config.Pin = shut_pins[sensor];
+  config.Speed = GPIO_SPEED_FREQ_LOW;
+  if (released != 0U)
+  {
+    /* HAL 在配置输入上拉时同步置位 ODR，不能只给开漏模式填写 PULLUP。 */
+    config.Mode = GPIO_MODE_INPUT;
+    config.Pull = GPIO_PULLUP;
+  }
+  else
+  {
+    /* 先预置低电平锁存，避免切到输出时短暂释放已经关闭的器件。 */
+    HAL_GPIO_WritePin(shut_ports[sensor], shut_pins[sensor], GPIO_PIN_RESET);
+    config.Mode = GPIO_MODE_OUTPUT_OD;
+    config.Pull = GPIO_NOPULL;
+  }
+  HAL_GPIO_Init(shut_ports[sensor], &config);
+}
+
 /* 使故障路数据失效并关闭该模块，防止部分初始化器件占用默认地址。 */
 static HAL_StatusTypeDef TOF_Fail(TOF_Sensor sensor, TOF_State state, HAL_StatusTypeDef status)
 {
@@ -34,7 +60,8 @@ static HAL_StatusTypeDef TOF_Fail(TOF_Sensor sensor, TOF_State state, HAL_Status
   ctx.latest.valid = 0U;
   ctx.latest.state = state;
   ctx.status = status;
-  HAL_GPIO_WritePin(shut_ports[sensor], shut_pins[sensor], GPIO_PIN_RESET);
+  ctx.last_retry_tick = HAL_GetTick();
+  TOF_SetXshut(sensor, 0U);
   return status;
 }
 
@@ -49,8 +76,8 @@ static HAL_StatusTypeDef TOF_InitSensor(TOF_Sensor sensor)
   ctx.latest.raw_status = 255U;
   ctx.latest.state = TOF_STATE_INIT_ERROR;
   ctx.latest.timestamp_ms = 0U;
-  /* GPIO 为开漏；SET 表示释放 XSHUT，由模块自带上拉拉高。 */
-  HAL_GPIO_WritePin(shut_ports[sensor], shut_pins[sensor], GPIO_PIN_SET);
+  /* 输入上拉补足模块外部上拉缺失时的释放电平，然后等待器件启动。 */
+  TOF_SetXshut(sensor, 1U);
   HAL_Delay(5U);
   ctx.device = VL53L0X();
   ctx.device.setTimeout(100U);
@@ -131,6 +158,8 @@ static HAL_StatusTypeDef TOF_UpdateSensor(TOF_Sensor sensor)
                   ctx.latest.raw_distance_mm <= 2000U && ctx.latest.distance_mm > 0U &&
                   ctx.latest.distance_mm <= 2000U) ? 1U : 0U;
   ctx.latest.state = ctx.latest.valid != 0U ? TOF_STATE_OK : TOF_STATE_RANGE_INVALID;
+  /* 真正收到有效回波后才恢复预算，防止初始化成功但马上掉线时无限重试。 */
+  if (ctx.latest.valid != 0U) { ctx.retry_count = 0U; }
   return HAL_OK;
 }
 
@@ -163,12 +192,13 @@ HAL_StatusTypeDef TOF_Init(void)
   /* 重复初始化同样先复位全部器件，清除上次留下的地址。 */
   for (i = 0U; i < TOF_SENSOR_COUNT; ++i)
   {
-    HAL_GPIO_WritePin(shut_ports[i], shut_pins[i], GPIO_PIN_RESET);
+    TOF_SetXshut((TOF_Sensor)i, 0U);
   }
   HAL_Delay(2U);
   /* 单路失败后仍尝试其他路，首个错误作为整体初始化结果。 */
   for (i = 0U; i < TOF_SENSOR_COUNT; ++i)
   {
+    sensors[i].retry_count = 0U;
     sensors[i].status = TOF_InitSensor((TOF_Sensor)i);
     if (result == HAL_OK && sensors[i].status != HAL_OK)
     {
@@ -182,6 +212,30 @@ HAL_StatusTypeDef TOF_Init(void)
     sensors[i].last_poll_tick = HAL_GetTick();
   }
   return result;
+}
+
+/* 故障路已由 TOF_Fail 拉低 XSHUT，等待足够时间后只重新初始化该路。
+   其他器件保留独立地址，禁止为了恢复一路而复位正常的两路。 */
+HAL_StatusTypeDef TOF_Recover(uint8_t allow)
+{
+  unsigned int i;
+  uint32_t now = HAL_GetTick();
+  if (allow == 0U) { return HAL_BUSY; }
+  for (i = 0U; i < TOF_SENSOR_COUNT; ++i)
+  {
+    TOF_Context &ctx = sensors[i];
+    /* 节拍差用无符号减法，兼容毫秒计数回绕；无效回波仍继续正常轮询。 */
+    if (ctx.initialized != 0U || ctx.retry_count >= TOF_RECOVERY_MAX_ATTEMPTS ||
+        (uint32_t)(now - ctx.last_retry_tick) < TOF_RECOVERY_INTERVAL_MS)
+    {
+      continue;
+    }
+    ctx.retry_count++;
+    ctx.last_retry_tick = now;
+    ctx.status = TOF_InitSensor((TOF_Sensor)i);
+    return ctx.status;
+  }
+  return HAL_BUSY;
 }
 
 /* 每轮服务全部模块，任何一路出错都不提前退出其他路的处理。 */

@@ -353,7 +353,7 @@
             <NoWarn>0</NoWarn>
             <uSurpInc>0</uSurpInc>
             <useXO>0</useXO>
-            <ClangAsOpt>1</ClangAsOpt>
+            <ClangAsOpt>4</ClangAsOpt>
             <VariousControls>
               <MiscControls></MiscControls>
               <Define></Define>
@@ -525,6 +525,21 @@
               <FileName>mpu6050.c</FileName>
               <FileType>1</FileType>
               <FilePath>../Core/Src/mpu6050.c</FilePath>
+            </File>
+            <File>
+              <FileName>heading.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/heading.c</FilePath>
+            </File>
+            <File>
+              <FileName>turn_control.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/turn_control.c</FilePath>
+            </File>
+            <File>
+              <FileName>maze.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>../Core/Src/maze.c</FilePath>
             </File>
             <File>
               <FileName>motor.c</FileName>

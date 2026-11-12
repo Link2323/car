@@ -1,6 +1,9 @@
 #include "bluetooth_tune.h"
 #include "hc05.h"
 #include "speed_control.h"
+#include "heading.h"
+#include "turn_control.h"
+#include "maze.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -173,12 +176,36 @@ static HAL_StatusTypeDef BluetoothTune_Start(const long *values)
   return status;
 }
 
-/* 命令分派：0~5 为调参，6 进入标定并清零，7 读取计数，8 退出标定。 */
+/* 完整协议与快捷命令共用迷宫启动入口，保留标定和定时试转的互斥条件。 */
+static HAL_StatusTypeDef BluetoothTune_StartMaze(void)
+{
+  if (calibration_active != 0U || session_running != 0U) { return HAL_BUSY; }
+  return Maze_Start();
+}
+
+/* 命令分派：0~5 为调参，6 进入标定并清零，7 读取计数，8 退出标定，
+   9 清零陀螺仪角度积分，10 陀螺仪闭环转向（正角左转、负角右转），
+   11 启动左手法则迷宫探索。 */
 static void BluetoothTune_Handle(const char *line)
 {
   long values[10];
   int count = BluetoothTune_Parse(line, values, 10);
   HAL_StatusTypeDef status = HAL_ERROR;
+  /* 只匹配完整快捷文本，仍需串口换行完成组帧，不使用普通事务号。
+     停止后可再次使用同一文本；运行中或故障锁存时由原启动接口拒绝。 */
+  if (strcmp(line, "tune:1") == 0)
+  {
+    status = BluetoothTune_StartMaze();
+    if (status == HAL_OK)
+    {
+      /* 新会话使旧事务缓存失效，避免再次发送旧停止命令时只回放成功回执。 */
+      last_id = 0L;
+      last_command[0] = '\0';
+      last_reply[0] = '\0';
+    }
+    BluetoothTune_Ack(1L, 11L, status);
+    return;
+  }
   if (count < 2 || values[0] < 0L)
   {
     BluetoothTune_Ack(0L, 0L, HAL_ERROR);
@@ -229,18 +256,60 @@ static void BluetoothTune_Handle(const char *line)
   }
   else
   {
-    if (values[1] == 2L && count == 5) { status = BluetoothTune_Start(values); }
+    if (values[1] == 2L && count == 5)
+    {
+      /* 迷宫探索占用速度环与转向，探索中拒绝直行命令。 */
+      if (Maze_IsActive() != 0U) { status = HAL_BUSY; }
+      else { status = BluetoothTune_Start(values); }
+    }
     else if (values[1] == 3L && count == 2)
     {
+      /* 停止命令同时结束直行会话、转向控制与迷宫探索，统一释放速度环。 */
       session_running = 0U;
-      SpeedControl_Stop();
+      TurnControl_Stop();
+      Maze_Stop();
       status = HAL_OK;
     }
     else if (values[1] == 5L && count == 4 && session_running != 0U &&
+             TurnControl_IsActive() == 0U &&
              values[2] >= -1000000L && values[2] <= 1000000L &&
              values[3] >= -1000000L && values[3] <= 1000000L)
     {
       status = SpeedControl_SetTarget((float)values[2], (float)values[3]);
+    }
+    /* 清零航向积分不改变电机状态，运动中也可调用；下一份样本重建基准。
+       转向或迷宫探索进行中清零会让绝对角度目标瞬间错位，先拒绝。 */
+    else if (values[1] == 9L && count == 2)
+    {
+      if (TurnControl_IsActive() != 0U || Maze_IsActive() != 0U)
+      {
+        status = HAL_BUSY;
+      }
+      else
+      {
+        Heading_Reset();
+        status = HAL_OK;
+      }
+    }
+    /* 陀螺仪闭环转向：正角度左转（z 增大）、负角度右转，非零且 ±360 内。
+       标定模式、直行会话或迷宫探索进行中时拒绝，避免双命令抢占速度环目标。 */
+    else if (values[1] == 10L && count == 3)
+    {
+      if (calibration_active != 0U || session_running != 0U ||
+          Maze_IsActive() != 0U)
+      {
+        status = HAL_BUSY;
+      }
+      else
+      {
+        status = TurnControl_Start((float)values[2]);
+      }
+    }
+    /* 左手法则迷宫探索：立即进入首次停车决策，感知与动作保护见 maze 模块。
+       标定模式、直行会话或转向进行中时拒绝。 */
+    else if (values[1] == 11L && count == 2)
+    {
+      status = BluetoothTune_StartMaze();
     }
     BluetoothTune_Ack(values[0], values[1], status);
   }
@@ -287,8 +356,10 @@ void BluetoothTune_Process(void)
   if (status == HAL_OK && line[0] != '\0') { BluetoothTune_Handle(line); }
   else if (status == HAL_ERROR)
   {
-    /* 丢包或缓冲溢出时撤销调试运动，不在未知命令流上继续运行。 */
+    /* 丢包或缓冲溢出时撤销调试运动（含转向与迷宫探索），不在未知命令流上继续运行。 */
     if (session_running != 0U) { SpeedControl_Stop(); session_running = 0U; }
+    TurnControl_Stop();
+    Maze_Stop();
     BluetoothTune_Ack(0L, 0L, HAL_ERROR);
   }
 }

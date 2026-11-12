@@ -1,7 +1,11 @@
 #include "bluetooth_tune.h"
 #include "hc05.h"
 #include "speed_control.h"
+#include "heading.h"
 #include "motor.h"
+#include "tof.h"
+#include "maze.h"
+#include "turn_control.h"
 #include "tim.h"
 #include "usart.h"
 #include <assert.h>
@@ -18,6 +22,14 @@ static uint8_t tx_blocked;
 
 /* 可控节拍用于验证会话时限、心跳截止和计时回绕。 */
 uint32_t HAL_GetTick(void) { return ticks; }
+
+/* 测距桩：恒定无效，迷宫状态机启动时因感知缺失拒绝，仅需链接符号。 */
+HAL_StatusTypeDef TOF_GetSensorData(TOF_Sensor sensor, TOF_Data *data)
+{
+  (void)sensor;
+  if (data != NULL) { data->valid = 0U; }
+  return HAL_ERROR;
+}
 
 /* 记录真实 HC05 发出的协议帧，立即完成或注入发送忙状态。 */
 HAL_StatusTypeDef HAL_UART_Transmit_IT(UART_HandleTypeDef *uart, const uint8_t *data, uint16_t length)
@@ -234,6 +246,70 @@ int main(void)
   assert(State().state == SPEED_CONTROL_RUNNING);
   Command("tune:30,3\n");
   Stopped();
+  /* 命令 9 清零航向积分：角度归零并重建基准，不影响电机状态。 */
+  {
+    MPU6050_Gyro gyro = {0.0f, 0.0f, 90.0f};
+    Heading_Update(&gyro, ticks);
+    Heading_Update(&gyro, ticks + 100U);
+    assert(Heading_GetData()->z_deg > 8.0f && Heading_GetData()->z_deg < 10.0f);
+    Command("tune:31,9\n");
+    assert(strcmp(sent, "ack:31,9,0\n") == 0);
+    assert(Heading_GetData()->z_deg == 0.0f && Heading_GetData()->valid == 0U);
+    Stopped();
+    /* 运行会话中同样允许清零，电机会话不受影响。 */
+    Command("tune:32,2,50,50,30000\n");
+    assert(State().state == SPEED_CONTROL_RUNNING);
+    Command("tune:33,9\n");
+    assert(strcmp(sent, "ack:33,9,0\n") == 0);
+    assert(Heading_GetData()->valid == 0U);
+    Command("tune:34,3\n");
+    Stopped();
+  }
+  /* 快捷命令必须经过真实迷宫启动条件，陀螺仪未准备好时不能放行。 */
+  assert(TurnControl_Init() == HAL_OK && Maze_Init() == HAL_OK);
+  Heading_Reset();
+  Command("tune:1\n");
+  assert(strcmp(sent, "ack:1,11,1\n") == 0 && Maze_IsActive() == 0U);
+  {
+    MPU6050_Gyro gyro = {0.0f, 0.0f, 0.0f};
+    Heading_Update(&gyro, ticks);
+  }
+  /* 快捷命令不占用完整协议的事务号 1，也不会破坏其缓存回复。 */
+  Command("tune:1,0\n");
+  assert(strncmp(sent, "cfg:1,", 6U) == 0);
+  Command("tune:1\r\n");
+  assert(strcmp(sent, "ack:1,11,0\n") == 0 && Maze_IsActive() != 0U);
+  Command("tune:1\n");
+  assert(strcmp(sent, "ack:1,11,2\n") == 0 && Maze_IsActive() != 0U);
+  Command("tune:1,0\n");
+  assert(strncmp(sent, "cfg:1,", 6U) == 0);
+  Command("tune:35,3\n");
+  assert(Maze_IsActive() == 0U);
+  Stopped();
+  /* 停止后再次发送同样的快捷命令可以重新启动，不受事务去重缓存影响。 */
+  Command("tune:1\n");
+  assert(strcmp(sent, "ack:1,11,0\n") == 0 && Maze_IsActive() != 0U);
+  /* 快捷启动改变了运行会话，旧停止回执不能让再次停止变成只回包不执行。 */
+  Command("tune:35,3\n");
+  assert(strcmp(sent, "ack:35,3,0\n") == 0 && Maze_IsActive() == 0U);
+  Stopped();
+  Command("tune:1\n");
+  assert(strcmp(sent, "ack:1,11,0\n") == 0 && Maze_IsActive() != 0U);
+  ticks += 300U;
+  Maze_Process();
+  /* 测距桩无效使迷宫故障锁存，快捷命令不能暗中清故障并重启。 */
+  Command("tune:1\n");
+  assert(strcmp(sent, "ack:1,11,2\n") == 0 && Maze_IsActive() == 0U);
+  Command("tune:36,3\n");
+  /* 标定锁仍生效，短命令不能绕过完整协议的模式互斥。 */
+  Command("tune:37,6\n");
+  Command("tune:1\n");
+  assert(strcmp(sent, "ack:1,11,2\n") == 0 && Maze_IsActive() == 0U);
+  Command("tune:38,8\n");
+  Command("tune:01\n");
+  assert(strcmp(sent, "ack:0,0,1\n") == 0);
+  Stopped();
+
   puts("Bluetooth UART-to-motor tuning integration tests passed");
   return 0;
 }

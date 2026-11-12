@@ -21,6 +21,10 @@ struct SimDevice
 static SimDevice devices[TOF_SENSOR_COUNT];
 static uint32_t ticks;
 static unsigned int transactions;
+/* 本场景刻意不提供模块外部上拉，只有输入上拉才能释放 XSHUT。 */
+static uint32_t pin_modes[TOF_SENSOR_COUNT];
+static uint32_t pin_pulls[TOF_SENSOR_COUNT];
+static uint8_t pin_odr[TOF_SENSOR_COUNT];
 
 /* 按地址查找唯一响应者，直接检查是否发生同地址冲突。 */
 static SimDevice *FindDevice(uint16_t addr)
@@ -43,18 +47,27 @@ uint32_t HAL_GetTick(void) { return ticks; }
 /* 只推进虚拟时间，测试无需真实等待。 */
 void HAL_Delay(uint32_t delay) { ticks += delay; }
 
-/* 三路各自响应 XSHUT，上电恢复默认地址；释放时检查没有地址冲突。 */
-void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState state)
+/* 将端口和引脚解析为方向，防止错误引脚或一次操作多路掩盖地址冲突。 */
+static unsigned int PinIndex(GPIO_TypeDef *port, uint16_t pin)
 {
   unsigned int index = TOF_SENSOR_COUNT;
   if (port == TOF_F_XSHUT_GPIO_Port && pin == TOF_F_XSHUT_Pin) { index = TOF_FRONT; }
   if (port == TOF_L_XSHUT_GPIO_Port && pin == TOF_L_XSHUT_Pin) { index = TOF_LEFT; }
   if (port == TOF_R_XSHUT_GPIO_Port && pin == TOF_R_XSHUT_Pin) { index = TOF_RIGHT; }
   assert(index < TOF_SENSOR_COUNT);
-  if (state == GPIO_PIN_SET) { assert(FindDevice(0x29U << 1) == NULL); }
+  return index;
+}
+
+/* 只在 XSHUT 真实上升沿恢复默认地址；开漏写高但缺少上拉时仍保持关断。 */
+static void RefreshXshut(unsigned int index)
+{
   SimDevice &d = devices[index];
-  d.powered = state == GPIO_PIN_SET;
-  if (d.powered != 0U)
+  uint8_t high = pin_modes[index] == GPIO_MODE_INPUT &&
+                 pin_pulls[index] == GPIO_PULLUP && pin_odr[index] != 0U;
+  if (high == d.powered) { return; }
+  if (high != 0U) { assert(FindDevice(0x29U << 1) == NULL); }
+  d.powered = high;
+  if (high != 0U)
   {
     memset(d.registers, 0, sizeof(d.registers));
     d.page = 0U;
@@ -70,6 +83,27 @@ void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState state)
     d.registers[0][0x71] = 1U;
     d.registers[0][0x72] = 0xFEU;
   }
+}
+
+/* ODR 只负责输出锁存，是否产生高电平由引脚模式与上拉共同决定。 */
+void HAL_GPIO_WritePin(GPIO_TypeDef *port, uint16_t pin, GPIO_PinState state)
+{
+  unsigned int index = PinIndex(port, pin);
+  pin_odr[index] = state == GPIO_PIN_SET;
+  RefreshXshut(index);
+}
+
+/* 模拟 F1 输入上拉会设置 ODR；关断必须使用开漏低电平，不允许推挽高。 */
+void HAL_GPIO_Init(GPIO_TypeDef *port, GPIO_InitTypeDef *config)
+{
+  unsigned int index = PinIndex(port, (uint16_t)config->Pin);
+  assert((config->Mode == GPIO_MODE_INPUT && config->Pull == GPIO_PULLUP) ||
+         (config->Mode == GPIO_MODE_OUTPUT_OD && config->Pull == GPIO_NOPULL));
+  pin_modes[index] = config->Mode;
+  pin_pulls[index] = config->Pull;
+  if (config->Mode == GPIO_MODE_INPUT) { pin_odr[index] = 1U; }
+  else { assert(pin_odr[index] == 0U); }
+  RefreshXshut(index);
 }
 
 /* 模拟连续寄存器读取、参考 SPAD 完成位及测量就绪位，可注入通信失败。 */
@@ -119,6 +153,7 @@ static void InitGood(void)
   {
     TOF_Data data;
     assert(devices[i].address == (addresses[i] << 1));
+    assert(pin_modes[i] == GPIO_MODE_INPUT && pin_pulls[i] == GPIO_PULLUP);
     assert(TOF_GetSensorData((TOF_Sensor)i, &data) == HAL_OK);
     assert(data.valid == 0U && data.state == TOF_STATE_WAITING);
     assert(TOF_GetSensorStatus((TOF_Sensor)i) == HAL_OK);
@@ -225,6 +260,38 @@ int main(void)
   assert(Data(TOF_FRONT).valid == 1U && Data(TOF_RIGHT).valid == 1U);
   ticks += TOF_SAMPLE_TIMEOUT_MS;
   assert(Data(TOF_FRONT).state == TOF_STATE_TIMEOUT && Data(TOF_FRONT).valid == 0U);
+  /* 右路一次通信失败后，在禁止恢复时不访问总线；允许恢复后只复位右路。 */
+  InitGood();
+  devices[TOF_RIGHT].fail_read = 1U;
+  ticks += TOF_POLL_PERIOD_MS;
+  (void)TOF_Update();
+  assert(Data(TOF_RIGHT).state == TOF_STATE_I2C_ERROR);
+  devices[TOF_RIGHT].fail_read = 0U;
+  ticks += TOF_RECOVERY_INTERVAL_MS;
+  before = transactions;
+  assert(TOF_Recover(0U) == HAL_BUSY && transactions == before);
+  assert(TOF_Recover(1U) == HAL_OK);
+  assert(devices[TOF_RIGHT].powered == 1U);
+  assert(devices[TOF_FRONT].address == (TOF_FRONT_ADDRESS << 1));
+  assert(devices[TOF_LEFT].address == (TOF_LEFT_ADDRESS << 1));
+  Echo(TOF_FRONT, 232U); Echo(TOF_LEFT, 333U); Echo(TOF_RIGHT, 444U);
+  ticks += TOF_POLL_PERIOD_MS;
+  assert(TOF_Update() == HAL_OK);
+  assert(Data(TOF_RIGHT).valid == 1U && Data(TOF_RIGHT).distance_mm == 444U);
+  /* 持续故障只能重试三次；次数用完后不再阻塞主循环，显式初始化可重置。 */
+  devices[TOF_RIGHT].fail_read = 1U;
+  ticks += TOF_POLL_PERIOD_MS;
+  (void)TOF_Update();
+  for (unsigned int attempt = 0U; attempt < TOF_RECOVERY_MAX_ATTEMPTS; ++attempt)
+  {
+    before = transactions;
+    assert(TOF_Recover(1U) == HAL_BUSY && transactions == before);
+    ticks += TOF_RECOVERY_INTERVAL_MS;
+    assert(TOF_Recover(1U) == HAL_ERROR);
+  }
+  ticks += TOF_RECOVERY_INTERVAL_MS;
+  before = transactions;
+  assert(TOF_Recover(1U) == HAL_BUSY && transactions == before);
   /* 在节拍回绕之前开始初始化，跨回绕后仍能正确节流及判断新鲜度。 */
   ticks = 0xFFFFFE00U;
   InitGood();

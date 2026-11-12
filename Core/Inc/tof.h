@@ -7,12 +7,15 @@
 extern "C" {
 #endif
 
-/* 三路共享 I2C1，地址均为七位地址，通过 XSHUT 逐路释放后改址。 */
+/* 三路共享 I2C1，地址均为七位地址，通过 XSHUT 逐路释放后改址。
+   XSHUT 关断采用开漏低电平，释放切为输入上拉，启用 F1 内部弱上拉。 */
 #define TOF_FRONT_ADDRESS       0x31U
 #define TOF_LEFT_ADDRESS        0x30U
 #define TOF_RIGHT_ADDRESS       0x32U
 #define TOF_POLL_PERIOD_MS      5U
 #define TOF_SAMPLE_TIMEOUT_MS   200U
+#define TOF_RECOVERY_INTERVAL_MS 2000U
+#define TOF_RECOVERY_MAX_ATTEMPTS 3U
 /* 前方模块临时偏移补偿：输出距离 = 原始距离 - 本值，单位 mm。
    根据 100→130、200→232、225→260 的实测数据，取平均偏差约 32 mm。
    此值仅适用于当前前方模块及测量基准；改为 0 可关闭补偿。 */
@@ -20,7 +23,8 @@ extern "C" {
 #define TOF_FRONT_OFFSET_MM     32
 #endif
 
-/* 左右模块尚未标定，不沿用前方模块的实测补偿。 */
+/* 左右模块 2026-10-27 实测：真实墙距 100 mm 时左路读约 104、右路约 116；
+   偏差较小暂不补偿，实测量保留备用，需要时填入读数减真实距离即可。 */
 #ifndef TOF_LEFT_OFFSET_MM
 #define TOF_LEFT_OFFSET_MM      0
 #endif
@@ -62,8 +66,13 @@ typedef struct
 HAL_StatusTypeDef TOF_Init(void);
 /* 每轮主循环调用：独立轮询三路，不等待测距完成。
    任一路故障仍处理其余路；返回首个错误、或有新帧时 HAL_OK、否则 HAL_BUSY。
-   I2C 访问仍为有界阻塞，故障路关闭后需 TOF_Init 重新初始化。 */
+   I2C 访问仍为有界阻塞，故障路关闭后由待机恢复接口重新初始化。 */
 HAL_StatusTypeDef TOF_Update(void);
+/* 仅在电机禁用、无运动任务时由主循环传入 allow=1。
+   每路故障间隔至少 2 秒重试，连续失败最多 3 次；一次只恢复一路。
+   初始化包含有界阻塞，运动期间必须传入 0。恢复不清除运动故障或启动电机。
+   收到有效测量后重置重试预算；无效回波不会被当成可通行距离。 */
+HAL_StatusTypeDef TOF_Recover(uint8_t allow);
 /* 复制前方快照，保留原有接口；同时校验数据新鲜度。 */
 HAL_StatusTypeDef TOF_GetData(TOF_Data *data);
 /* 按方向复制快照并检查新鲜度；方向越界或 NULL 返回 HAL_ERROR。 */
